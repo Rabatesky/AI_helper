@@ -12,7 +12,7 @@
 import logging
 
 from app.config import MAX_TOOL_ROUNDS
-from app.llm import LLMClient, LLMReply
+from app.llm import LLMClient, LLMReply, ToolCallSchemaError
 from app.prompts import build_system_prompt
 from app.tools import TOOL_SPECS, ToolBox, ToolContext
 
@@ -51,11 +51,30 @@ async def respond(
     messages: list[dict] = [*history, {"role": "user", "content": user_text}]
 
     for round_number in range(1, MAX_TOOL_ROUNDS + 1):
-        reply = await llm.complete(
-            system=build_system_prompt(),
-            messages=messages,
-            tools=TOOL_SPECS,
-        )
+        try:
+            reply = await llm.complete(
+                system=build_system_prompt(),
+                messages=messages,
+                tools=TOOL_SPECS,
+            )
+        except ToolCallSchemaError as exc:
+            # Модель вызвала инструмент с неподходящими аргументами, и провайдер
+            # отклонил вызов, не доведя его до нас. Роняли бы ответ целиком —
+            # вместо этого объясняем промах и даём следующий круг на исправление.
+            logger.warning("Круг %s: вызов отклонён по схеме", round_number)
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Предыдущий вызов инструмента отклонён: аргументы не "
+                        "соответствуют схеме. Неверный вызов: "
+                        f"{exc.failed_generation[:300]}. "
+                        "Вызови инструмент заново, указав ровно те поля, которые "
+                        "описаны в его схеме, и ничего сверх них."
+                    ),
+                }
+            )
+            continue
 
         if not reply.wants_tools:
             return reply.text or "Модель вернула пустой ответ. Попробуй переформулировать."
@@ -68,7 +87,7 @@ async def respond(
             logger.info(
                 "Круг %s: вызываем %s(%s)", round_number, call.name, call.arguments
             )
-            result = toolbox.execute(call.name, call.arguments, ctx)
+            result = await toolbox.execute(call.name, call.arguments, ctx)
 
             # Роль "tool" — ответ на конкретный вызов, связь по tool_call_id.
             messages.append(

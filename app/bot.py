@@ -34,6 +34,7 @@ from app.llm import LLMClient
 from app.reminders import ReminderScheduler, ReminderStore
 from app.stt import SpeechToText
 from app.tools import ToolBox, ToolContext
+from app.websearch import WebSearch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,6 +119,10 @@ async def handle_start(message: Message) -> None:
         "Наговори сообщение — распознаю речь и отвечу. Сначала покажу, что именно "
         "услышал, чтобы ты сразу увидел, если я ошибся.\n"
         "\n"
+        "🔍 Поиск в интернете\n"
+        "Спрашивай про погоду, курсы валют, новости, цены, часы работы — найду "
+        "и отвечу по свежим данным, а не по устаревшей памяти.\n"
+        "\n"
         "⏰ Напоминания\n"
         "Разовые: «напомни завтра в 9 позвонить маме», "
         "«не забыть бы в пятницу забрать посылку».\n"
@@ -132,8 +137,8 @@ async def handle_start(message: Message) -> None:
         "\n"
         "ЧТО ДАЛЬШЕ\n"
         "Меня продолжают развивать. В планах: долгая память о фактах (чтобы не "
-        "напоминать каждый раз, кто ты и что любишь), поиск в интернете, поиск мест "
-        "поблизости, сводки из внешних сервисов и утренний дайджест.\n"
+        "напоминать каждый раз, кто ты и что любишь), поиск мест поблизости, "
+        "сводки из внешних сервисов и утренний дайджест.\n"
         "\n"
         "Если чего-то не хватает — скажи, это лучший способ определить, "
         "что делать следующим."
@@ -334,7 +339,7 @@ async def main() -> None:
     # База создаётся при первом запуске, отдельная установка не нужна.
     conn = connect()
     reminders = ReminderStore(conn)
-    toolbox = ToolBox(reminders)
+    toolbox = ToolBox(reminders, WebSearch())
     scheduler = ReminderScheduler(reminders, bot, interval_seconds=REMINDER_TICK_SECONDS)
 
     # Кладём зависимости в диспетчер. aiogram передаст их в те хендлеры,
