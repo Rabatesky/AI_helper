@@ -18,6 +18,7 @@ from app.config import TIMEZONE
 from app.prompts import format_now
 from app.recurrence import Recurrence, RecurrenceError
 from app.reminders import ReminderStore
+from app.websearch import SearchError, WebSearch
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,42 @@ TOOL_SPECS: list[dict] = [
     {
         "type": "function",
         "function": {
+            # Имя намеренно не «search» и не «search_web»: модели gpt-oss
+            # обучены со встроенным браузером, где поиск идёт в два шага
+            # (search, затем open с полями id и cursor). Похожее имя будило
+            # этот заученный сценарий, и модель слала аргументы от чужого
+            # инструмента вместо нашего query.
+            "name": "lookup_current_info",
+            "description": (
+                "Найти актуальную информацию в интернете. Использовать всегда, "
+                "когда ответ зависит от сегодняшнего дня или от данных, которых "
+                "нет в твоих знаниях: погода, курсы валют, новости, цены, часы "
+                "работы заведений, результаты событий. "
+                "НЕ использовать для общих знаний, которые ты и так знаешь, — "
+                "определения, объяснения, история, программирование. "
+                "Инструмент сразу возвращает готовые выдержки из найденных "
+                "страниц: открывать страницы отдельным вызовом не нужно и нельзя. "
+                "Единственный аргумент — query."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Поисковый запрос — так, как его набрал бы человек "
+                            "в поисковике. Например: «погода Казань сегодня». "
+                            "Не пиши вопрос целиком фразой из диалога."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_reminders",
             "description": (
                 "Показать активные напоминания пользователя. Использовать, когда "
@@ -171,16 +208,23 @@ TOOL_SPECS: list[dict] = [
 
 
 class ToolBox:
-    """Исполняет инструменты, о которых просит модель."""
+    """Исполняет инструменты, о которых просит модель.
 
-    def __init__(self, store: ReminderStore) -> None:
+    Метод execute асинхронный, хотя работа с базой синхронная: сетевые навыки
+    (поиск, а в будущем обращения к внешним API) обязаны быть асинхронными,
+    иначе на время запроса встанет обработка всех остальных сообщений.
+    """
+
+    def __init__(self, store: ReminderStore, search: WebSearch) -> None:
         self._store = store
+        self._search = search
 
-    def execute(self, name: str, arguments: dict, ctx: ToolContext) -> str:
+    async def execute(self, name: str, arguments: dict, ctx: ToolContext) -> str:
         """Выполняет инструмент и возвращает текстовый результат для модели."""
         handler = {
             "create_reminder": self._create_reminder,
             "create_recurring_reminder": self._create_recurring_reminder,
+            "lookup_current_info": self._search_web,
             "list_reminders": self._list_reminders,
             "cancel_reminder": self._cancel_reminder,
         }.get(name)
@@ -192,14 +236,34 @@ class ToolBox:
             return f"Ошибка: инструмента {name} не существует."
 
         try:
-            return handler(arguments, ctx)
+            return await handler(arguments, ctx)
         except Exception:
             logger.exception("Ошибка при выполнении инструмента %s", name)
             return "Ошибка: не удалось выполнить действие."
 
     # --- Отдельные инструменты ------------------------------------------------
 
-    def _create_reminder(self, args: dict, ctx: ToolContext) -> str:
+    async def _search_web(self, args: dict, ctx: ToolContext) -> str:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return "Ошибка: не указан поисковый запрос."
+
+        try:
+            results = await self._search.search(query)
+        except SearchError as exc:
+            return f"Ошибка: {exc}"
+
+        if not results:
+            return f"По запросу «{query}» ничего не нашлось. Попробуй переформулировать."
+
+        # Отдаём модели пронумерованный список: заголовок, выдержка, адрес.
+        # Модель сама выберет нужное и сформулирует ответ человеку.
+        lines = [f"Результаты поиска по запросу «{query}»:"]
+        for number, item in enumerate(results, start=1):
+            lines.append(f"{number}. {item.title}\n   {item.snippet}\n   Источник: {item.url}")
+        return "\n".join(lines)
+
+    async def _create_reminder(self, args: dict, ctx: ToolContext) -> str:
         raw_when = str(args.get("when", "")).strip()
         what = str(args.get("what", "")).strip()
 
@@ -231,7 +295,7 @@ class ToolBox:
             f"на {reminder.local_time()}."
         )
 
-    def _create_recurring_reminder(self, args: dict, ctx: ToolContext) -> str:
+    async def _create_recurring_reminder(self, args: dict, ctx: ToolContext) -> str:
         what = str(args.get("what", "")).strip()
         if not what:
             return "Ошибка: не указано, о чём напоминать."
@@ -259,7 +323,7 @@ class ToolBox:
             f"{rule.describe()}. Первое сработает {reminder.local_time()}."
         )
 
-    def _list_reminders(self, args: dict, ctx: ToolContext) -> str:
+    async def _list_reminders(self, args: dict, ctx: ToolContext) -> str:
         reminders = self._store.list_pending(ctx.user_id)
         if not reminders:
             return "Активных напоминаний нет."
@@ -270,7 +334,7 @@ class ToolBox:
         ]
         return "Активные напоминания:\n" + "\n".join(lines)
 
-    def _cancel_reminder(self, args: dict, ctx: ToolContext) -> str:
+    async def _cancel_reminder(self, args: dict, ctx: ToolContext) -> str:
         raw_id = args.get("reminder_id")
         try:
             reminder_id = int(raw_id)

@@ -14,7 +14,7 @@ import json
 import logging
 from dataclasses import dataclass
 
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 
 from app.api_errors import friendly_errors
 from app.config import (
@@ -26,6 +26,19 @@ from app.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ToolCallSchemaError(RuntimeError):
+    """Модель вызвала инструмент с аргументами, не подходящими под схему.
+
+    Groq проверяет вызовы на своей стороне и отвечает 400 tool_use_failed, не
+    доводя запрос до нас. Ошибка модели, а не сбой сервиса, поэтому не роняем
+    ответ целиком: сообщаем модели о промахе и даём попробовать снова.
+    """
+
+    def __init__(self, failed_generation: str) -> None:
+        super().__init__(failed_generation)
+        self.failed_generation = failed_generation
 
 
 @dataclass(frozen=True)
@@ -83,12 +96,21 @@ class LLMClient:
         payload = [{"role": "system", "content": system}, *messages]
 
         with friendly_errors("запрос к модели"):
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=payload,
-                temperature=self._temperature,
-                tools=tools or None,  # пустой список API не любит, шлём None
-            )
+            try:
+                response = await self._client.chat.completions.create(
+                    model=self._model,
+                    messages=payload,
+                    temperature=self._temperature,
+                    tools=tools or None,  # пустой список API не любит, шлём None
+                )
+            except APIStatusError as exc:
+                # Отделяем промах модели от настоящего сбоя API: первый
+                # поправим на следующем круге, второй показываем пользователю.
+                details = self._tool_use_failure(exc)
+                if details is None:
+                    raise
+                logger.warning("Модель промахнулась мимо схемы инструмента: %s", details)
+                raise ToolCallSchemaError(details) from exc
 
         if usage := response.usage:
             # Полезно видеть расход: так заранее понятно, когда история
@@ -101,6 +123,22 @@ class LLMClient:
             )
 
         return self._parse(response)
+
+    @staticmethod
+    def _tool_use_failure(exc: APIStatusError) -> str | None:
+        """Возвращает текст неудачного вызова, если это промах по схеме.
+
+        None означает, что ошибка другая и обрабатывать её надо как обычно.
+        """
+        if exc.status_code != 400:
+            return None
+
+        body = exc.body if isinstance(exc.body, dict) else {}
+        error = body.get("error", {}) if isinstance(body.get("error"), dict) else {}
+        if error.get("code") != "tool_use_failed":
+            return None
+
+        return str(error.get("failed_generation") or error.get("message") or "")
 
     @staticmethod
     def _parse(response) -> LLMReply:
