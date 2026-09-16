@@ -20,7 +20,12 @@ from dataclasses import dataclass
 
 from ddgs import DDGS
 
-from app.config import SEARCH_MAX_RESULTS, SEARCH_REGION, SEARCH_TIMEOUT_SECONDS
+from app.config import (
+    SEARCH_BACKENDS,
+    SEARCH_MAX_RESULTS,
+    SEARCH_REGION,
+    SEARCH_TIMEOUT_SECONDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +49,16 @@ class WebSearch:
         max_results: int = SEARCH_MAX_RESULTS,
         region: str = SEARCH_REGION,
         timeout: int = SEARCH_TIMEOUT_SECONDS,
+        backends: str = SEARCH_BACKENDS,
     ) -> None:
         self._max_results = max_results
         self._region = region
         self._timeout = timeout
+        # Список бэкендов перечислением через запятую. Библиотека сама переберёт
+        # их по очереди. Оставлять выбор на её усмотрение нельзя: часть
+        # источников не отвечает вовсе, а часть на предметных запросах отдаёт
+        # энциклопедические статьи вместо профильных сайтов.
+        self._backends = backends
 
     async def search(self, query: str) -> list[SearchResult]:
         """Ищет и возвращает список результатов (может быть пустым)."""
@@ -84,5 +95,10 @@ class WebSearch:
     def _search_blocking(self, query: str) -> list[dict]:
         with DDGS() as ddgs:
             return list(
-                ddgs.text(query, region=self._region, max_results=self._max_results)
+                ddgs.text(
+                    query,
+                    region=self._region,
+                    max_results=self._max_results,
+                    backend=self._backends,
+                )
             )
